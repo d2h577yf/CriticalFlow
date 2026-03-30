@@ -1,0 +1,29 @@
+# app
+[package]
+name = "app"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "criticalflow"
+path = "src/main.rs"
+
+[dependencies]
+graph_engine = {path = "../graph_engine"}
+bridge = {path = "../bridge"}
+
+serde = {workspace = true}
+serde_json = {workspace = true}
+toml = {workspace = true}
+tokio = {workspace = true}
+anyhow = {workspace = true}
+
+axum = {workspace = true}
+tower = {workspace = true}
+
+hmac = {workspace = true}
+sha2 = {workspace = true}
+hex = {workspace = true}
+
+eframe = {workspace = true}
+egui = {workspace = true}

@@ -1,0 +1,13 @@
+[project]
+name = "criticalflow"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "maturin>=1.12.6",
+    "numpy>=2.4.4",
+    "openai>=2.30.0",
+    "pydantic>=2.12.5",
+    "python-dotenv>=1.2.2",
+    "sqlmodel>=0.0.37",
+]

@@ -1,0 +1,33 @@
+# root
+[workspace]
+members = [
+    "crates/app",
+    "crates/bridge",
+    "crates/graph_engine"
+]
+
+resolver = "2"
+
+[workspace.dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+toml = "1.1.0"
+
+tokio = {version = "1.50.0",features = ["full"]}
+
+anyhow = "1.0.102"
+thiserror = "2.0.18"
+
+pyo3 = {version = "0.28.2",features = ["extension-module"]}
+
+petgraph = "0.8.3"
+
+axum = "0.8.8"
+tower = "0.5.3"
+
+hmac = "0.13.0"
+sha2 = "0.11.0"
+hex = "0.4.3"
+
+eframe = "0.34.1"
+egui = "0.34.1"

@@ -1,0 +1,16 @@
+# bridge
+[package]
+name = "bridge"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["rlib"]
+
+[dependencies]
+serde = {workspace = true}
+serde_json = {workspace = true}
+anyhow = {workspace = true}
+tokio = {workspace = true}
+
+pyo3 = {version = "0.28.2",features = ["auto-initialize"]}
