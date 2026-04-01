@@ -11,8 +11,8 @@ use crate::{
 fn map_aoe_error(err: crate::AoeError) -> PyErr {
     match err {
         crate::AoeError::CycleDetected { .. }
-         crate::AoeError::UnknownTask(_)
-        crate::AoeError::ParseError(_) => PyValueError::new_err(err.to_string()),
+        | crate::AoeError::UnknownTask(_)
+        | crate::AoeError::ParseError(_) => PyValueError::new_err(err.to_string()),
         crate::AoeError::IoError(_) => PyRuntimeError::new_err(err.to_string()),
     }
 }
