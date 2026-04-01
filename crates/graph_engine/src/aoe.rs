@@ -72,8 +72,9 @@ impl AoeNet {
                 .get(&dep.from)
                 .ok_or_else(|| AoeError::UnknownTask(dep.from.clone()))?;
             let &to_idx = index_map
-                .get((&dep.to))
+                .get(&dep.to)
                 .ok_or_else(|| AoeError::UnknownTask(dep.to.clone()))?;
+            graph.add_edge(from_idx,to_idx,());
         };
 
         toposort(&graph,None).map_err(|cycle| AoeError::CycleDetected {
