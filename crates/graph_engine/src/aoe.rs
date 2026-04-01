@@ -26,7 +26,7 @@ impl Task {
     }
 
     pub fn std_dev(&self) -> f64 {
-        (self.duration_optimistic - self.duration_pessimistic) / 6.0
+        (self.duration_pessimistic - self.duration_optimistic) / 6.0
     }
 }
 
