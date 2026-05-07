@@ -1,13 +1,15 @@
 pub mod aoe;
 pub mod critical_path;
+pub mod layout;
 
 #[cfg(feature = "python")]
 mod python_api;
 
 use std::path::Path;
 
-pub use aoe::{AoeNet, Task, Dependency, ProjectData,AoeError};
+pub use aoe::{AoeNet, Task, Dependency, ProjectData, AoeError};
 pub use critical_path::{compute_critical_path, CriticalPathResult, TaskSchedule};
+pub use layout::{compute_layout, GraphLayout, NodeLayout};
 
 pub fn compute_critical_path_from_project(data: ProjectData) -> Result<CriticalPathResult, AoeError> {
     let net = data.into_net()?;
