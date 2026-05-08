@@ -43,6 +43,9 @@ pub fn compute_layout(net: &AoeNet, result: &CriticalPathResult) -> GraphLayout 
     for &idx in &topo {
         layer_nodes[layers[&idx]].push(idx);
     }
+    for nodes_in_layer in &mut layer_nodes {
+        nodes_in_layer.sort_by(|a, b| net.task(*a).id.cmp(&net.task(*b).id));
+    }
 
     let critical_set: HashSet<&str> = result.critical_path.iter().map(|s| s.as_str()).collect();
 
