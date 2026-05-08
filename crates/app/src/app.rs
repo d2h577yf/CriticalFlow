@@ -1,16 +1,16 @@
-use eframe::{Frame, egui};
+use eframe::{egui, Frame};
 use egui::{
-    Align2, Color32, CornerRadius, CursorIcon, FontId, Pos2, Rect, Sense, Stroke, StrokeKind, Ui,
-    Vec2,
+    Align, Align2, Color32, CornerRadius, CursorIcon, FontId, Layout, Pos2, Rect, Sense, Stroke,
+    StrokeKind, Ui, Vec2,
 };
 use std::collections::{HashMap, HashSet};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Arc;
-use std::sync::mpsc::{self, Receiver, Sender};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use graph_engine::{
-    CriticalPathResult, Dependency, GraphLayout, NodeLayout, ProjectData, Task,
     compute_critical_path_from_json, compute_critical_path_from_project, compute_layout,
+    CriticalPathResult, Dependency, GraphLayout, NodeLayout, ProjectData, Task,
 };
 
 #[path = "mock_llm.rs"]
@@ -29,6 +29,11 @@ const GRAPH_ZOOM_MIN: f32 = 0.35;
 const GRAPH_ZOOM_MAX: f32 = 2.75;
 const GRAPH_ZOOM_STEP: f32 = 1.18;
 const GRAPH_TRANSITION_SECONDS: f32 = 0.75;
+const NODE_DRAG_ELASTICITY: f32 = 0.62;
+const NODE_SPRING_STIFFNESS: f32 = 86.0;
+const NODE_SPRING_DAMPING: f32 = 11.5;
+const NODE_SPRING_OFFSET_EPS: f32 = 0.35;
+const NODE_SPRING_VELOCITY_EPS: f32 = 3.5;
 
 const CRITICAL_FILL: Color32 = Color32::from_rgb(255, 215, 190);
 const CRITICAL_BORDER: Color32 = Color32::from_rgb(210, 70, 60);
@@ -46,7 +51,6 @@ const DURATION_TEXT: Color32 = Color32::from_rgb(115, 115, 120);
 // ── App types ──────────────────────────────────────────────────────
 
 pub enum LlmMessage {
-    Thinking,
     Done(String),
     Error(String),
 }
@@ -54,6 +58,8 @@ pub enum LlmMessage {
 pub struct ChatMessage {
     pub is_user: bool,
     pub content: String,
+    pub pending: bool,
+    pub is_error: bool,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -63,18 +69,28 @@ enum RunningMode {
 }
 
 struct GraphTransition {
-    from: GraphLayout,
+    from: Arc<GraphLayout>,
     started_at: Instant,
     from_zoom: f32,
     from_pan: Vec2,
+    old_edges: Arc<HashSet<(String, String)>>,
+    from_node_offsets: Arc<HashMap<String, Vec2>>,
 }
 
 struct GraphTransitionFrame {
-    from: GraphLayout,
+    from: Arc<GraphLayout>,
+    old_edges: Arc<HashSet<(String, String)>>,
+    from_node_offsets: Arc<HashMap<String, Vec2>>,
     raw_progress: f32,
     eased_progress: f32,
     from_zoom: f32,
     from_pan: Vec2,
+}
+
+struct GraphFrameRects {
+    current: Vec<Rect>,
+    from: Option<Vec<Rect>>,
+    animated: Option<Vec<Rect>>,
 }
 
 struct AddNodeForm {
@@ -104,11 +120,11 @@ impl Default for AddNodeForm {
 pub struct InputWindow {
     user_input: String,
     chat_history: Vec<ChatMessage>,
+    pending_assistant_message: Option<usize>,
 
     mode: RunningMode,
     status_msg: String,
 
-    llm_sender: Option<Sender<String>>,
     result_receiver: Option<Receiver<LlmMessage>>,
 
     // ── Graph state ────────────────────────────────────────────
@@ -120,10 +136,15 @@ pub struct InputWindow {
     graph_pan: Vec2,
     graph_fit_pending: bool,
     graph_transition: Option<GraphTransition>,
+    node_world_offsets: HashMap<String, Vec2>,
+    node_world_velocities: HashMap<String, Vec2>,
+    dragging_node_id: Option<String>,
 
     selected_node_id: Option<String>,
     context_node_id: Option<String>,
+    confirm_delete_node_id: Option<String>,
     show_add_node_dialog: bool,
+    add_node_focus_pending: bool,
     add_node_form: AddNodeForm,
 }
 
@@ -132,9 +153,9 @@ impl Default for InputWindow {
         InputWindow {
             user_input: String::new(),
             chat_history: Vec::new(),
+            pending_assistant_message: None,
             mode: RunningMode::Idle,
             status_msg: String::from("就绪"),
-            llm_sender: None,
             result_receiver: None,
             project_data: None,
             critical_path: None,
@@ -143,9 +164,14 @@ impl Default for InputWindow {
             graph_pan: Vec2::ZERO,
             graph_fit_pending: true,
             graph_transition: None,
+            node_world_offsets: HashMap::new(),
+            node_world_velocities: HashMap::new(),
+            dragging_node_id: None,
             selected_node_id: None,
             context_node_id: None,
+            confirm_delete_node_id: None,
             show_add_node_dialog: false,
+            add_node_focus_pending: false,
             add_node_form: AddNodeForm::default(),
         }
     }
@@ -192,18 +218,42 @@ impl InputWindow {
         if animate {
             if let Some(previous) = &self.graph_layout {
                 self.graph_transition = Some(GraphTransition {
-                    from: previous.clone(),
+                    from: Arc::new(previous.clone()),
                     started_at: Instant::now(),
                     from_zoom: self.graph_zoom,
                     from_pan: self.graph_pan,
+                    old_edges: Arc::new(Self::edge_id_set(previous)),
+                    from_node_offsets: Arc::new(self.node_world_offsets.clone()),
                 });
             }
         } else {
             self.graph_transition = None;
         }
 
+        self.prune_node_offsets(&layout);
         self.graph_layout = Some(layout);
         self.graph_fit_pending = true;
+    }
+
+    fn prune_node_offsets(&mut self, layout: &GraphLayout) {
+        let node_ids: HashSet<&str> = layout.nodes.iter().map(|node| node.id.as_str()).collect();
+        self.node_world_offsets
+            .retain(|node_id, _| node_ids.contains(node_id.as_str()));
+        self.node_world_velocities
+            .retain(|node_id, _| node_ids.contains(node_id.as_str()));
+
+        if self
+            .dragging_node_id
+            .as_deref()
+            .is_some_and(|node_id| !node_ids.contains(node_id))
+        {
+            self.dragging_node_id = None;
+        }
+    }
+
+    fn request_graph_fit(&mut self) {
+        self.graph_fit_pending = true;
+        self.graph_transition = None;
     }
 
     fn commit_project_data(&mut self, data: ProjectData, animate: bool) -> Result<(), String> {
@@ -216,6 +266,37 @@ impl InputWindow {
         Ok(())
     }
 
+    fn chat_user(&mut self, content: String) {
+        self.chat_history.push(ChatMessage {
+            is_user: true,
+            content,
+            pending: false,
+            is_error: false,
+        });
+    }
+
+    fn chat_assistant(&mut self, content: String, pending: bool, is_error: bool) {
+        self.chat_history.push(ChatMessage {
+            is_user: false,
+            content,
+            pending,
+            is_error,
+        });
+    }
+
+    fn replace_pending_assistant(&mut self, content: String, is_error: bool) {
+        if let Some(index) = self.pending_assistant_message.take() {
+            if let Some(message) = self.chat_history.get_mut(index) {
+                message.content = content;
+                message.pending = false;
+                message.is_error = is_error;
+                return;
+            }
+        }
+
+        self.chat_assistant(content, false, is_error);
+    }
+
     fn open_add_node_dialog(&mut self, predecessors: &[String], successors: &[String]) {
         self.add_node_form = AddNodeForm::default();
         self.add_node_form
@@ -225,6 +306,40 @@ impl InputWindow {
             .successor_ids
             .extend(successors.iter().cloned());
         self.show_add_node_dialog = true;
+        self.add_node_focus_pending = true;
+    }
+
+    fn add_node_validation_error(&self) -> Option<String> {
+        let name = self.add_node_form.name.trim();
+        if name.is_empty() {
+            return Some(String::from("任务名不能为空"));
+        }
+
+        let opt = self.add_node_form.duration_optimistic;
+        let normal = self.add_node_form.duration_normal;
+        let pess = self.add_node_form.duration_pessimistic;
+
+        if !opt.is_finite() || !normal.is_finite() || !pess.is_finite() {
+            return Some(String::from("工期必须是有效数字"));
+        }
+
+        if opt <= 0.0 || normal <= 0.0 || pess <= 0.0 {
+            return Some(String::from("工期必须大于 0"));
+        }
+
+        if !(opt <= normal && normal <= pess) {
+            return Some(String::from("请保持乐观 <= 最可能 <= 悲观"));
+        }
+
+        if !self
+            .add_node_form
+            .predecessor_ids
+            .is_disjoint(&self.add_node_form.successor_ids)
+        {
+            return Some(String::from("同一任务不能同时作为前置和后续"));
+        }
+
+        None
     }
 
     fn next_task_id(data: &ProjectData) -> String {
@@ -240,39 +355,15 @@ impl InputWindow {
     }
 
     fn add_manual_node(&mut self) {
-        let name = self.add_node_form.name.trim().to_string();
-        if name.is_empty() {
-            self.add_node_form.error = Some(String::from("任务名不能为空"));
+        if let Some(error) = self.add_node_validation_error() {
+            self.add_node_form.error = Some(error);
             return;
         }
 
+        let name = self.add_node_form.name.trim().to_string();
         let opt = self.add_node_form.duration_optimistic;
         let normal = self.add_node_form.duration_normal;
         let pess = self.add_node_form.duration_pessimistic;
-
-        if !opt.is_finite() || !normal.is_finite() || !pess.is_finite() {
-            self.add_node_form.error = Some(String::from("工期必须是有效数字"));
-            return;
-        }
-
-        if opt <= 0.0 || normal <= 0.0 || pess <= 0.0 {
-            self.add_node_form.error = Some(String::from("工期必须大于 0"));
-            return;
-        }
-
-        if !(opt <= normal && normal <= pess) {
-            self.add_node_form.error = Some(String::from("请保持乐观 <= 最可能 <= 悲观"));
-            return;
-        }
-
-        if !self
-            .add_node_form
-            .predecessor_ids
-            .is_disjoint(&self.add_node_form.successor_ids)
-        {
-            self.add_node_form.error = Some(String::from("同一任务不能同时作为前置和后续"));
-            return;
-        }
 
         let mut next_data = self.project_data.clone().unwrap_or(ProjectData {
             tasks: Vec::new(),
@@ -357,6 +448,9 @@ impl InputWindow {
                 if self.context_node_id.as_deref() == Some(node_id) {
                     self.context_node_id = None;
                 }
+                if self.confirm_delete_node_id.as_deref() == Some(node_id) {
+                    self.confirm_delete_node_id = None;
+                }
                 self.status_msg = format!("已删除节点 {} {}", node_id, task_name);
             }
             Err(err) => {
@@ -371,10 +465,9 @@ impl InputWindow {
             return;
         }
 
-        self.chat_history.push(ChatMessage {
-            is_user: true,
-            content: input.clone(),
-        });
+        self.chat_user(input.clone());
+        self.chat_assistant(String::from("正在分析..."), true, false);
+        self.pending_assistant_message = Some(self.chat_history.len() - 1);
 
         self.user_input.clear();
         self.mode = RunningMode::Running;
@@ -386,49 +479,77 @@ impl InputWindow {
         std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(800));
             let (data, _result, _summary) = mock_llm::generate_mock_project(&input);
-            let json = serde_json::to_string(&data).unwrap();
-            let _ = tx.send(LlmMessage::Done(json));
+            match serde_json::to_string(&data) {
+                Ok(json) => {
+                    let _ = tx.send(LlmMessage::Done(json));
+                }
+                Err(err) => {
+                    let _ = tx.send(LlmMessage::Error(format!("结果序列化失败：{}", err)));
+                }
+            }
         });
     }
 
     fn poll_llm_result(&mut self) {
-        if let Some(rx) = &self.result_receiver {
-            match rx.try_recv() {
-                Ok(LlmMessage::Done(result)) => {
-                    if let Ok(data) = serde_json::from_str::<ProjectData>(&result) {
-                        if let Ok(cp) = compute_critical_path_from_json(&result) {
-                            if let Ok(net) = data.clone().into_net() {
-                                self.set_graph_layout(compute_layout(&net, &cp), true);
-                                self.project_data = Some(data);
-                                self.critical_path = Some(cp);
+        let message = match self.result_receiver.as_ref() {
+            Some(rx) => match rx.try_recv() {
+                Ok(message) => Some(message),
+                Err(TryRecvError::Empty) => None,
+                Err(TryRecvError::Disconnected) => {
+                    Some(LlmMessage::Error(String::from("分析线程已断开")))
+                }
+            },
+            None => None,
+        };
 
-                                let summary = format!(
-                                    "分析完成\n共 {} 个任务，关键路径：{}\n预计工期：{:.1} 天",
-                                    self.critical_path.as_ref().unwrap().schedules.len(),
-                                    self.critical_path
-                                        .as_ref()
-                                        .unwrap()
-                                        .critical_path
-                                        .join(" → "),
-                                    self.critical_path.as_ref().unwrap().project_duration,
-                                );
-                                self.chat_history.push(ChatMessage {
-                                    is_user: false,
-                                    content: summary,
-                                });
-                            }
-                        }
+        let Some(message) = message else {
+            return;
+        };
+
+        match message {
+            LlmMessage::Done(result) => {
+                let outcome = (|| -> Result<String, String> {
+                    let data = serde_json::from_str::<ProjectData>(&result)
+                        .map_err(|e| format!("项目数据解析失败：{}", e))?;
+                    let result = compute_critical_path_from_project(data.clone())
+                        .map_err(|e| e.to_string())?;
+                    let net = data.clone().into_net().map_err(|e| e.to_string())?;
+                    let summary = format!(
+                        "分析完成\n共 {} 个任务，关键路径：{}\n预计工期：{:.1} 天",
+                        result.schedules.len(),
+                        result.critical_path.join(" → "),
+                        result.project_duration,
+                    );
+                    self.node_world_offsets.clear();
+                    self.node_world_velocities.clear();
+                    self.dragging_node_id = None;
+                    self.set_graph_layout(compute_layout(&net, &result), true);
+                    self.project_data = Some(data);
+                    self.critical_path = Some(result);
+                    Ok(summary)
+                })();
+
+                match outcome {
+                    Ok(summary) => {
+                        self.replace_pending_assistant(summary, false);
+                        self.status_msg = String::from("完成");
                     }
-                    self.mode = RunningMode::Idle;
-                    self.status_msg = String::from("完成");
-                    self.result_receiver = None;
+                    Err(err) => {
+                        let message = format!("分析失败：{}", err);
+                        self.replace_pending_assistant(message.clone(), true);
+                        self.status_msg = message;
+                    }
                 }
-                Ok(LlmMessage::Error(e)) => {
-                    self.status_msg = format!("错误：{}", e);
-                    self.mode = RunningMode::Idle;
-                    self.result_receiver = None;
-                }
-                _ => {}
+
+                self.mode = RunningMode::Idle;
+                self.result_receiver = None;
+            }
+            LlmMessage::Error(e) => {
+                let message = format!("分析失败：{}", e);
+                self.replace_pending_assistant(message.clone(), true);
+                self.status_msg = message;
+                self.mode = RunningMode::Idle;
+                self.result_receiver = None;
             }
         }
     }
@@ -440,12 +561,15 @@ impl InputWindow {
     fn draw_aoe_graph(&mut self, ui: &mut Ui, layout: &GraphLayout) {
         let graph_is_empty = layout.nodes.is_empty();
         let world_size = Self::graph_world_size(layout);
+        self.animate_node_return(ui);
 
         let mut zoom_target = None;
         let mut fit_requested = false;
+        let edit_enabled = self.mode == RunningMode::Idle;
+        let selected_node_id = self.selected_node_id.clone();
 
         ui.horizontal(|ui| {
-            if ui.button("-").clicked() {
+            if ui.button("-").on_hover_text("缩小").clicked() {
                 zoom_target = Some(self.graph_zoom / GRAPH_ZOOM_STEP);
             }
 
@@ -462,28 +586,60 @@ impl InputWindow {
                 zoom_target = Some(slider_zoom);
             }
 
-            if ui.button("+").clicked() {
+            if ui.button("+").on_hover_text("放大").clicked() {
                 zoom_target = Some(self.graph_zoom * GRAPH_ZOOM_STEP);
             }
 
             ui.label(format!("{:.0}%", self.graph_zoom * 100.0));
 
-            if ui.button("1:1").clicked() {
+            if ui.button("100%").on_hover_text("重置缩放").clicked() {
                 zoom_target = Some(1.0);
             }
 
-            if ui.button("适配").clicked() {
+            if ui.button("适配").on_hover_text("适配当前图").clicked() {
                 fit_requested = true;
             }
 
             ui.separator();
-            let add_button = egui::Button::new("+ 添加节点")
+            let add_button = egui::Button::new("添加节点...")
                 .fill(Color32::from_rgb(64, 118, 205))
                 .stroke(Stroke::new(1.0, Color32::from_rgb(42, 88, 170)))
-                .min_size(Vec2::new(92.0, 24.0));
-            if ui.add(add_button).clicked() {
+                .min_size(Vec2::new(96.0, 24.0));
+            if ui.add_enabled(edit_enabled, add_button).clicked() {
                 self.open_add_node_dialog(&[], &[]);
             }
+
+            if let Some(node_id) = selected_node_id.as_ref() {
+                if ui
+                    .add_enabled(edit_enabled, egui::Button::new("添加前置..."))
+                    .clicked()
+                {
+                    self.open_add_node_dialog(&[], &[node_id.clone()]);
+                }
+                if ui
+                    .add_enabled(edit_enabled, egui::Button::new("添加后续..."))
+                    .clicked()
+                {
+                    self.open_add_node_dialog(&[node_id.clone()], &[]);
+                }
+                if ui
+                    .add_enabled(edit_enabled, egui::Button::new("删除..."))
+                    .clicked()
+                {
+                    self.confirm_delete_node_id = Some(node_id.clone());
+                }
+            }
+
+            ui.menu_button("布局", |ui| {
+                if ui.button("适配视图").clicked() {
+                    fit_requested = true;
+                    ui.close();
+                }
+                if ui.button("缩放到 100%").clicked() {
+                    zoom_target = Some(1.0);
+                    ui.close();
+                }
+            });
 
             if let Some(cp) = &self.critical_path {
                 ui.separator();
@@ -498,7 +654,7 @@ impl InputWindow {
         let (response, painter) = ui.allocate_painter(canvas_size, Sense::click_and_drag());
         let view_rect = response.rect;
 
-        let transition = if fit_requested {
+        let mut transition = if fit_requested {
             self.graph_transition = None;
             None
         } else {
@@ -527,13 +683,33 @@ impl InputWindow {
             self.set_graph_zoom_around(target, view_rect.center(), view_rect);
         }
 
-        self.handle_graph_input(ui, &response, view_rect);
         self.constrain_graph_pan(view_rect, world_size);
+
+        let mut frame_rects = self.graph_frame_rects(
+            view_rect,
+            layout,
+            transition.as_ref().map(|transition| {
+                (
+                    transition.from.as_ref(),
+                    transition.from_node_offsets.as_ref(),
+                    transition.raw_progress,
+                    transition.eased_progress,
+                )
+            }),
+        );
+
+        if self.handle_graph_input(ui, &response, view_rect, layout, &frame_rects.current) {
+            self.graph_fit_pending = false;
+            self.graph_transition = None;
+            transition = None;
+            self.constrain_graph_pan(view_rect, world_size);
+            frame_rects = self.graph_frame_rects(view_rect, layout, None);
+        }
 
         if response.secondary_clicked() {
             self.context_node_id = response
                 .interact_pointer_pos()
-                .and_then(|pos| self.hit_test_node(view_rect, layout, pos));
+                .and_then(|pos| Self::hit_test_node(layout, &frame_rects.current, pos));
             if let Some(node_id) = &self.context_node_id {
                 self.selected_node_id = Some(node_id.clone());
             }
@@ -541,17 +717,19 @@ impl InputWindow {
 
         if response.clicked() {
             if let Some(pos) = response.interact_pointer_pos() {
-                self.selected_node_id = self.hit_test_node(view_rect, layout, pos);
+                self.selected_node_id = Self::hit_test_node(layout, &frame_rects.current, pos);
             }
         }
 
-        if response.hovered()
+        if self.dragging_node_id.is_some() {
+            ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+        } else if response.hovered()
             && ui
                 .input(|i| i.pointer.hover_pos())
-                .and_then(|pos| self.hit_test_node(view_rect, layout, pos))
+                .and_then(|pos| Self::hit_test_node(layout, &frame_rects.current, pos))
                 .is_some()
         {
-            ui.ctx().set_cursor_icon(CursorIcon::PointingHand);
+            ui.ctx().set_cursor_icon(CursorIcon::Grab);
         }
 
         let bg = if ui.visuals().dark_mode {
@@ -574,57 +752,102 @@ impl InputWindow {
             self.draw_transitioning_graph(
                 ui,
                 &painter,
-                view_rect,
                 &transition.from,
                 layout,
-                transition.raw_progress,
+                transition.old_edges.as_ref(),
+                frame_rects.from.as_deref().unwrap_or(&[]),
+                frame_rects
+                    .animated
+                    .as_deref()
+                    .unwrap_or(&frame_rects.current),
                 transition.eased_progress,
             );
         } else {
-            self.draw_graph_layout(ui, &painter, view_rect, layout);
+            self.draw_graph_layout(ui, &painter, layout, &frame_rects.current);
         }
 
         self.draw_graph_legend(&painter, view_rect);
 
         egui::Popup::context_menu(&response)
-            .width(180.0)
-            .show(|ui| self.draw_graph_context_menu(ui));
+            .width(220.0)
+            .show(|ui| self.draw_graph_context_menu(ui, view_rect));
 
         if !response.context_menu_opened() {
             self.context_node_id = None;
         }
     }
 
-    fn draw_graph_context_menu(&mut self, ui: &mut Ui) {
-        ui.set_min_width(180.0);
-        ui.set_max_width(240.0);
+    fn draw_graph_context_menu(&mut self, ui: &mut Ui, view_rect: Rect) {
+        ui.set_min_width(200.0);
+        ui.set_max_width(260.0);
+        let edit_enabled = self.mode == RunningMode::Idle;
 
         if let Some(node_id) = self.context_node_id.clone() {
             let label = self.task_label(&node_id).unwrap_or_else(|| node_id.clone());
             ui.add(
-                egui::Label::new(egui::RichText::new(Self::fit_text(&label, 210.0, 13.0)).strong())
+                egui::Label::new(egui::RichText::new(Self::fit_text(&label, 230.0, 13.0)).strong())
                     .wrap(),
             );
             ui.separator();
 
-            if ui.button("添加前置节点").clicked() {
+            if ui
+                .add_enabled(edit_enabled, egui::Button::new("添加前置节点..."))
+                .clicked()
+            {
                 self.open_add_node_dialog(&[], &[node_id.clone()]);
                 ui.close();
             }
 
-            if ui.button("添加后续节点").clicked() {
+            if ui
+                .add_enabled(edit_enabled, egui::Button::new("添加后续节点..."))
+                .clicked()
+            {
                 self.open_add_node_dialog(&[node_id.clone()], &[]);
                 ui.close();
             }
 
-            ui.separator();
-            if ui.button("删除节点").clicked() {
-                self.delete_node(&node_id);
+            if ui.button("取消选择").clicked() {
+                self.selected_node_id = None;
                 ui.close();
             }
-        } else if ui.button("添加节点").clicked() {
-            self.open_add_node_dialog(&[], &[]);
-            ui.close();
+
+            ui.separator();
+            if ui
+                .add_enabled(edit_enabled, egui::Button::new("删除节点..."))
+                .clicked()
+            {
+                self.confirm_delete_node_id = Some(node_id.clone());
+                ui.close();
+            }
+        } else {
+            if ui
+                .add_enabled(edit_enabled, egui::Button::new("添加节点..."))
+                .clicked()
+            {
+                self.open_add_node_dialog(&[], &[]);
+                ui.close();
+            }
+
+            if ui
+                .add_enabled(
+                    self.selected_node_id.is_some(),
+                    egui::Button::new("清除选择"),
+                )
+                .clicked()
+            {
+                self.selected_node_id = None;
+                ui.close();
+            }
+
+            ui.separator();
+            if ui.button("适配视图").clicked() {
+                self.request_graph_fit();
+                ui.close();
+            }
+            if ui.button("缩放到 100%").clicked() {
+                self.set_graph_zoom_around(1.0, view_rect.center(), view_rect);
+                ui.close();
+            }
         }
     }
 
@@ -632,13 +855,16 @@ impl InputWindow {
         let snapshot = self.graph_transition.as_ref().map(|transition| {
             (
                 transition.from.clone(),
+                transition.old_edges.clone(),
+                transition.from_node_offsets.clone(),
                 transition.started_at.elapsed().as_secs_f32(),
                 transition.from_zoom,
                 transition.from_pan,
             )
         });
 
-        let Some((from, elapsed, from_zoom, from_pan)) = snapshot else {
+        let Some((from, old_edges, from_node_offsets, elapsed, from_zoom, from_pan)) = snapshot
+        else {
             return None;
         };
 
@@ -651,6 +877,8 @@ impl InputWindow {
         ui.ctx().request_repaint();
         Some(GraphTransitionFrame {
             from,
+            old_edges,
+            from_node_offsets,
             raw_progress,
             eased_progress: Self::ease_out_cubic(raw_progress),
             from_zoom,
@@ -662,38 +890,46 @@ impl InputWindow {
         &self,
         ui: &Ui,
         painter: &egui::Painter,
-        view_rect: Rect,
         layout: &GraphLayout,
+        rects: &[Rect],
     ) {
-        let rect_by_id = self.layout_screen_rect_map(view_rect, layout);
-        self.draw_layout_edges(painter, layout, &rect_by_id, 1.0, None);
+        self.draw_layout_edges(painter, layout, rects, 1.0, None);
 
-        for node in &layout.nodes {
-            if let Some(rect) = rect_by_id.get(&node.id) {
-                self.draw_graph_node(ui, painter, node, *rect, 1.0);
-            }
+        for (node, rect) in layout.nodes.iter().zip(rects.iter()) {
+            self.draw_graph_node(ui, painter, node, *rect, 1.0);
         }
     }
 
-    fn draw_transitioning_graph(
+    fn graph_frame_rects(
         &self,
-        ui: &Ui,
-        painter: &egui::Painter,
         view_rect: Rect,
-        from_layout: &GraphLayout,
-        to_layout: &GraphLayout,
-        raw_progress: f32,
-        eased_progress: f32,
-    ) {
-        let from_rects = self.layout_screen_rect_map(view_rect, from_layout);
-        let to_rects = self.layout_screen_rect_map(view_rect, to_layout);
-        let old_edges = Self::edge_id_set(from_layout);
-        let new_edges = Self::edge_id_set(to_layout);
+        layout: &GraphLayout,
+        transition: Option<(&GraphLayout, &HashMap<String, Vec2>, f32, f32)>,
+    ) -> GraphFrameRects {
+        let current = self.layout_screen_rects(view_rect, layout);
 
-        let mut animated_rects = HashMap::new();
-        for node in &to_layout.nodes {
-            if let Some(to_rect) = to_rects.get(&node.id) {
-                let rect = if let Some(from_rect) = from_rects.get(&node.id) {
+        let Some((from_layout, from_offsets, raw_progress, eased_progress)) = transition else {
+            return GraphFrameRects {
+                current,
+                from: None,
+                animated: None,
+            };
+        };
+
+        let from = self.layout_screen_rects_with_offsets(view_rect, from_layout, from_offsets);
+        let from_rects_by_id: HashMap<&str, Rect> = from_layout
+            .nodes
+            .iter()
+            .zip(from.iter())
+            .map(|(node, rect)| (node.id.as_str(), *rect))
+            .collect();
+
+        let animated: Vec<Rect> = layout
+            .nodes
+            .iter()
+            .zip(current.iter())
+            .map(|(node, to_rect)| {
+                if let Some(from_rect) = from_rects_by_id.get(node.id.as_str()) {
                     Self::lerp_rect(*from_rect, *to_rect, eased_progress)
                 } else {
                     let offset = Vec2::new(28.0 * (1.0 - eased_progress), 0.0);
@@ -702,10 +938,34 @@ impl InputWindow {
                         Rect::from_center_size(to_rect.center() - offset, to_rect.size()),
                         scale,
                     )
-                };
-                animated_rects.insert(node.id.clone(), rect);
-            }
+                }
+            })
+            .collect();
+
+        GraphFrameRects {
+            current: animated.clone(),
+            from: Some(from),
+            animated: Some(animated),
         }
+    }
+
+    fn draw_transitioning_graph(
+        &self,
+        ui: &Ui,
+        painter: &egui::Painter,
+        from_layout: &GraphLayout,
+        to_layout: &GraphLayout,
+        old_edges: &HashSet<(String, String)>,
+        from_rects: &[Rect],
+        animated_rects: &[Rect],
+        eased_progress: f32,
+    ) {
+        let new_edges = Self::edge_id_set(to_layout);
+        let to_ids: HashSet<&str> = to_layout
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
 
         for &(from_idx, to_idx) in &from_layout.edges {
             let from_node = &from_layout.nodes[from_idx];
@@ -716,7 +976,7 @@ impl InputWindow {
             }
 
             if let (Some(from_rect), Some(to_rect)) =
-                (from_rects.get(&from_node.id), from_rects.get(&to_node.id))
+                (from_rects.get(from_idx), from_rects.get(to_idx))
             {
                 self.draw_graph_edge(
                     painter,
@@ -732,31 +992,33 @@ impl InputWindow {
         self.draw_layout_edges(
             painter,
             to_layout,
-            &animated_rects,
+            animated_rects,
             1.0,
-            Some((&old_edges, eased_progress)),
+            Some((old_edges, eased_progress)),
         );
 
-        for node in &from_layout.nodes {
-            if to_rects.contains_key(&node.id) {
+        for (node, rect) in from_layout.nodes.iter().zip(from_rects.iter()) {
+            if to_ids.contains(node.id.as_str()) {
                 continue;
             }
 
-            if let Some(rect) = from_rects.get(&node.id) {
-                let fade_rect = Self::scale_rect_from_center(*rect, 1.0 - 0.16 * eased_progress);
-                self.draw_graph_node(ui, painter, node, fade_rect, 1.0 - eased_progress);
-            }
+            let fade_rect = Self::scale_rect_from_center(*rect, 1.0 - 0.16 * eased_progress);
+            self.draw_graph_node(ui, painter, node, fade_rect, 1.0 - eased_progress);
         }
 
-        for node in &to_layout.nodes {
-            if let Some(rect) = animated_rects.get(&node.id) {
-                let alpha = if from_rects.contains_key(&node.id) {
-                    1.0
-                } else {
-                    eased_progress
-                };
-                self.draw_graph_node(ui, painter, node, *rect, alpha);
-            }
+        let from_ids: HashSet<&str> = from_layout
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect();
+
+        for (node, rect) in to_layout.nodes.iter().zip(animated_rects.iter()) {
+            let alpha = if from_ids.contains(node.id.as_str()) {
+                1.0
+            } else {
+                eased_progress
+            };
+            self.draw_graph_node(ui, painter, node, *rect, alpha);
         }
     }
 
@@ -764,7 +1026,7 @@ impl InputWindow {
         &self,
         painter: &egui::Painter,
         layout: &GraphLayout,
-        rect_by_id: &HashMap<String, Rect>,
+        rects: &[Rect],
         base_alpha: f32,
         new_edge_alpha: Option<(&HashSet<(String, String)>, f32)>,
     ) {
@@ -772,10 +1034,10 @@ impl InputWindow {
             let from_node = &layout.nodes[from_idx];
             let to_node = &layout.nodes[to_idx];
 
-            let Some(from_rect) = rect_by_id.get(&from_node.id) else {
+            let Some(from_rect) = rects.get(from_idx) else {
                 continue;
             };
-            let Some(to_rect) = rect_by_id.get(&to_node.id) else {
+            let Some(to_rect) = rects.get(to_idx) else {
                 continue;
             };
 
@@ -914,32 +1176,36 @@ impl InputWindow {
         }
     }
 
-    fn layout_screen_rect_map(
+    fn layout_screen_rects(&self, view_rect: Rect, layout: &GraphLayout) -> Vec<Rect> {
+        self.layout_screen_rects_with_offsets(view_rect, layout, &self.node_world_offsets)
+    }
+
+    fn layout_screen_rects_with_offsets(
         &self,
         view_rect: Rect,
         layout: &GraphLayout,
-    ) -> HashMap<String, Rect> {
+        offsets: &HashMap<String, Vec2>,
+    ) -> Vec<Rect> {
         let layer_sizes = self.layer_sizes(layout);
         let world_size = Self::graph_world_size(layout);
-        Self::node_world_rects(layout, &layer_sizes, world_size)
+        Self::base_node_world_rects(layout, &layer_sizes, world_size)
             .into_iter()
             .zip(layout.nodes.iter())
-            .map(|(rect, node)| (node.id.clone(), self.world_rect_to_screen(view_rect, rect)))
+            .map(|(rect, node)| {
+                let offset = offsets.get(&node.id).copied().unwrap_or(Vec2::ZERO);
+                self.world_rect_to_screen(view_rect, rect.translate(offset))
+            })
             .collect()
     }
 
-    fn hit_test_node(&self, view_rect: Rect, layout: &GraphLayout, pos: Pos2) -> Option<String> {
-        let rect_by_id = self.layout_screen_rect_map(view_rect, layout);
+    fn hit_test_node(layout: &GraphLayout, rects: &[Rect], pos: Pos2) -> Option<String> {
         layout
             .nodes
             .iter()
+            .zip(rects.iter())
             .rev()
-            .find(|node| {
-                rect_by_id
-                    .get(&node.id)
-                    .is_some_and(|rect| rect.contains(pos))
-            })
-            .map(|node| node.id.clone())
+            .find(|(_, rect)| rect.contains(pos))
+            .map(|(node, _)| node.id.clone())
     }
 
     fn edge_id_set(layout: &GraphLayout) -> HashSet<(String, String)> {
@@ -967,7 +1233,7 @@ impl InputWindow {
         )
     }
 
-    fn node_world_rects(
+    fn base_node_world_rects(
         layout: &GraphLayout,
         layer_sizes: &[usize],
         world_size: Vec2,
@@ -1004,7 +1270,102 @@ impl InputWindow {
         (zoom, pan)
     }
 
-    fn handle_graph_input(&mut self, ui: &Ui, response: &egui::Response, view_rect: Rect) {
+    fn animate_node_return(&mut self, ui: &Ui) {
+        if self.node_world_offsets.is_empty() && self.node_world_velocities.is_empty() {
+            return;
+        }
+
+        let dt = ui.input(|i| i.stable_dt).clamp(0.001, 0.033);
+        let dragging_node_id = self.dragging_node_id.as_deref();
+        let node_ids: HashSet<String> = self
+            .node_world_offsets
+            .keys()
+            .chain(self.node_world_velocities.keys())
+            .cloned()
+            .collect();
+        let offset_eps_sq = NODE_SPRING_OFFSET_EPS * NODE_SPRING_OFFSET_EPS;
+        let velocity_eps_sq = NODE_SPRING_VELOCITY_EPS * NODE_SPRING_VELOCITY_EPS;
+        let mut needs_repaint = false;
+
+        for node_id in node_ids {
+            if dragging_node_id == Some(node_id.as_str()) {
+                needs_repaint = true;
+                continue;
+            }
+
+            let offset = self
+                .node_world_offsets
+                .get(&node_id)
+                .copied()
+                .unwrap_or(Vec2::ZERO);
+            let mut velocity = self
+                .node_world_velocities
+                .get(&node_id)
+                .copied()
+                .unwrap_or(Vec2::ZERO);
+            let acceleration = -offset * NODE_SPRING_STIFFNESS - velocity * NODE_SPRING_DAMPING;
+            velocity += acceleration * dt;
+            let next_offset = offset + velocity * dt;
+
+            if next_offset.length_sq() <= offset_eps_sq && velocity.length_sq() <= velocity_eps_sq {
+                self.node_world_offsets.remove(&node_id);
+                self.node_world_velocities.remove(&node_id);
+            } else {
+                self.node_world_offsets.insert(node_id.clone(), next_offset);
+                self.node_world_velocities.insert(node_id, velocity);
+                needs_repaint = true;
+            }
+        }
+
+        if needs_repaint {
+            ui.ctx().request_repaint();
+        }
+    }
+
+    fn handle_graph_input(
+        &mut self,
+        ui: &Ui,
+        response: &egui::Response,
+        view_rect: Rect,
+        layout: &GraphLayout,
+        rects: &[Rect],
+    ) -> bool {
+        let mut interacted = false;
+        let edit_enabled = self.mode == RunningMode::Idle;
+
+        if edit_enabled && response.drag_started_by(egui::PointerButton::Primary) {
+            let hit_pos = ui
+                .input(|i| i.pointer.press_origin())
+                .or_else(|| response.interact_pointer_pos());
+            if let Some(node_id) = hit_pos.and_then(|pos| Self::hit_test_node(layout, rects, pos)) {
+                self.selected_node_id = Some(node_id.clone());
+                self.dragging_node_id = Some(node_id);
+                if let Some(node_id) = self.dragging_node_id.as_ref() {
+                    self.node_world_velocities.remove(node_id);
+                }
+            }
+        }
+
+        if let Some(node_id) = self.dragging_node_id.clone() {
+            if response.dragged_by(egui::PointerButton::Primary) {
+                let world_delta = response.drag_delta() / self.graph_zoom.max(0.001);
+                if world_delta.length_sq() > 0.0 {
+                    let dt = ui.input(|i| i.stable_dt).clamp(0.001, 0.033);
+                    self.move_node_by_world_delta(layout, &node_id, world_delta, dt);
+                }
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+                ui.ctx().request_repaint();
+            }
+
+            let primary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Primary));
+            if response.drag_stopped_by(egui::PointerButton::Primary) || !primary_down {
+                self.dragging_node_id = None;
+                ui.ctx().request_repaint();
+            }
+
+            return true;
+        }
+
         let is_dragging = response.dragged_by(egui::PointerButton::Primary)
             || response.dragged_by(egui::PointerButton::Secondary)
             || response.dragged_by(egui::PointerButton::Middle);
@@ -1012,6 +1373,7 @@ impl InputWindow {
         if is_dragging {
             self.graph_pan += response.drag_delta();
             ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            interacted = true;
         } else if response.hovered() {
             ui.ctx().set_cursor_icon(CursorIcon::Grab);
         }
@@ -1031,8 +1393,61 @@ impl InputWindow {
                     .input(|i| i.pointer.hover_pos())
                     .unwrap_or_else(|| view_rect.center());
                 self.set_graph_zoom_around(self.graph_zoom * zoom_factor, anchor, view_rect);
+                interacted = true;
             }
         }
+
+        interacted
+    }
+
+    fn move_node_by_world_delta(
+        &mut self,
+        layout: &GraphLayout,
+        node_id: &str,
+        world_delta: Vec2,
+        dt: f32,
+    ) -> bool {
+        let current = self
+            .node_world_offsets
+            .get(node_id)
+            .copied()
+            .unwrap_or(Vec2::ZERO);
+        let drag_delta = world_delta * NODE_DRAG_ELASTICITY;
+        let next = self.clamp_node_world_offset(layout, node_id, current + drag_delta);
+
+        if (next - current).length_sq() <= 0.0001 {
+            return false;
+        }
+
+        self.node_world_offsets.insert(node_id.to_owned(), next);
+        self.node_world_velocities
+            .insert(node_id.to_owned(), (next - current) / dt);
+
+        true
+    }
+
+    fn clamp_node_world_offset(&self, layout: &GraphLayout, node_id: &str, offset: Vec2) -> Vec2 {
+        let Some(index) = layout.nodes.iter().position(|node| node.id == node_id) else {
+            return offset;
+        };
+
+        let layer_sizes = self.layer_sizes(layout);
+        let world_size = Self::graph_world_size(layout);
+        let Some(base_rect) = Self::base_node_world_rects(layout, &layer_sizes, world_size)
+            .get(index)
+            .copied()
+        else {
+            return offset;
+        };
+
+        Vec2::new(
+            offset
+                .x
+                .clamp(-base_rect.left(), world_size.x - base_rect.right()),
+            offset
+                .y
+                .clamp(-base_rect.top(), world_size.y - base_rect.bottom()),
+        )
     }
 
     fn set_graph_zoom_around(&mut self, target_zoom: f32, anchor: Pos2, view_rect: Rect) {
@@ -1166,6 +1581,10 @@ impl InputWindow {
     }
 
     fn draw_graph_legend(&self, painter: &egui::Painter, view_rect: Rect) {
+        if view_rect.width() < 280.0 || view_rect.height() < 90.0 {
+            return;
+        }
+
         let rect = Rect::from_min_size(
             view_rect.left_top() + Vec2::new(12.0, 12.0),
             Vec2::new(232.0, 34.0),
@@ -1249,6 +1668,54 @@ impl InputWindow {
         sizes
     }
 
+    fn draw_dependency_picker(
+        ui: &mut Ui,
+        form: &mut AddNodeForm,
+        task_options: &[(String, String)],
+        predecessor: bool,
+    ) -> bool {
+        let (title, hint) = if predecessor {
+            ("前置任务", "选中任务 -> 新任务")
+        } else {
+            ("后续任务", "新任务 -> 选中任务")
+        };
+        let (selected_ids, opposite_ids) = if predecessor {
+            (&mut form.predecessor_ids, &mut form.successor_ids)
+        } else {
+            (&mut form.successor_ids, &mut form.predecessor_ids)
+        };
+
+        let mut changed = false;
+        ui.label(title);
+        ui.weak(hint);
+        egui::ScrollArea::vertical()
+            .id_salt(if predecessor {
+                "predecessor_tasks_scroll"
+            } else {
+                "successor_tasks_scroll"
+            })
+            .max_height(180.0)
+            .show(ui, |ui| {
+                if task_options.is_empty() {
+                    ui.weak("暂无可选任务");
+                }
+
+                for (task_id, label) in task_options {
+                    let mut selected = selected_ids.contains(task_id);
+                    if ui.checkbox(&mut selected, label).changed() {
+                        changed = true;
+                        if selected {
+                            selected_ids.insert(task_id.clone());
+                            opposite_ids.remove(task_id);
+                        } else {
+                            selected_ids.remove(task_id);
+                        }
+                    }
+                }
+            });
+        changed
+    }
+
     fn draw_add_node_dialog(&mut self, ctx: &egui::Context) {
         if !self.show_add_node_dialog {
             return;
@@ -1268,47 +1735,67 @@ impl InputWindow {
         let mut open = self.show_add_node_dialog;
         let mut add_clicked = false;
         let mut cancel_clicked = false;
+        let mut form_changed = false;
+        let validation_error = self
+            .add_node_form
+            .error
+            .clone()
+            .or_else(|| self.add_node_validation_error());
 
         egui::Window::new("添加节点")
             .open(&mut open)
             .collapsible(false)
-            .resizable(false)
-            .default_width(340.0)
+            .resizable(true)
+            .min_width(360.0)
+            .default_width(420.0)
             .show(ctx, |ui| {
                 ui.label("任务名");
-                ui.add(
+                let name_id = ui.make_persistent_id("add_node_name");
+                let name_response = ui.add(
                     egui::TextEdit::singleline(&mut self.add_node_form.name)
+                        .id(name_id)
                         .desired_width(f32::INFINITY),
                 );
+                if self.add_node_focus_pending {
+                    name_response.request_focus();
+                    self.add_node_focus_pending = false;
+                }
+                form_changed |= name_response.changed();
 
                 ui.add_space(8.0);
                 ui.label("三点估算工期");
                 ui.horizontal(|ui| {
                     ui.label("乐观");
-                    ui.add(
-                        egui::DragValue::new(&mut self.add_node_form.duration_optimistic)
-                            .speed(0.1)
-                            .range(0.1..=999.0)
-                            .suffix(" 天"),
-                    );
+                    form_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.add_node_form.duration_optimistic)
+                                .speed(0.1)
+                                .range(0.1..=999.0)
+                                .suffix(" 天"),
+                        )
+                        .changed();
                 });
                 ui.horizontal(|ui| {
                     ui.label("最可能");
-                    ui.add(
-                        egui::DragValue::new(&mut self.add_node_form.duration_normal)
-                            .speed(0.1)
-                            .range(0.1..=999.0)
-                            .suffix(" 天"),
-                    );
+                    form_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.add_node_form.duration_normal)
+                                .speed(0.1)
+                                .range(0.1..=999.0)
+                                .suffix(" 天"),
+                        )
+                        .changed();
                 });
                 ui.horizontal(|ui| {
                     ui.label("悲观");
-                    ui.add(
-                        egui::DragValue::new(&mut self.add_node_form.duration_pessimistic)
-                            .speed(0.1)
-                            .range(0.1..=999.0)
-                            .suffix(" 天"),
-                    );
+                    form_changed |= ui
+                        .add(
+                            egui::DragValue::new(&mut self.add_node_form.duration_pessimistic)
+                                .speed(0.1)
+                                .range(0.1..=999.0)
+                                .suffix(" 天"),
+                        )
+                        .changed();
                 });
 
                 ui.add_space(8.0);
@@ -1316,75 +1803,73 @@ impl InputWindow {
                     ui.label("依赖关系");
                     ui.weak("可多选");
                 });
-                ui.columns(2, |columns| {
-                    columns[0].push_id("predecessor_tasks", |ui| {
-                        ui.label("前置任务");
-                        ui.weak("选中任务 -> 新任务");
-                        egui::ScrollArea::vertical()
-                            .id_salt("predecessor_tasks_scroll")
-                            .max_height(150.0)
-                            .show(ui, |ui| {
-                                if task_options.is_empty() {
-                                    ui.weak("暂无可选任务");
-                                }
-
-                                for (task_id, label) in &task_options {
-                                    let mut selected =
-                                        self.add_node_form.predecessor_ids.contains(task_id);
-                                    if ui.checkbox(&mut selected, label).changed() {
-                                        if selected {
-                                            self.add_node_form
-                                                .predecessor_ids
-                                                .insert(task_id.clone());
-                                            self.add_node_form.successor_ids.remove(task_id);
-                                        } else {
-                                            self.add_node_form.predecessor_ids.remove(task_id);
-                                        }
-                                    }
-                                }
-                            });
+                let wide = ui.available_width() >= 460.0;
+                if wide {
+                    ui.columns(2, |columns| {
+                        form_changed |= Self::draw_dependency_picker(
+                            &mut columns[0],
+                            &mut self.add_node_form,
+                            &task_options,
+                            true,
+                        );
+                        form_changed |= Self::draw_dependency_picker(
+                            &mut columns[1],
+                            &mut self.add_node_form,
+                            &task_options,
+                            false,
+                        );
                     });
+                } else {
+                    form_changed |= Self::draw_dependency_picker(
+                        ui,
+                        &mut self.add_node_form,
+                        &task_options,
+                        true,
+                    );
+                    ui.add_space(8.0);
+                    form_changed |= Self::draw_dependency_picker(
+                        ui,
+                        &mut self.add_node_form,
+                        &task_options,
+                        false,
+                    );
+                }
 
-                    columns[1].push_id("successor_tasks", |ui| {
-                        ui.label("后续任务");
-                        ui.weak("新任务 -> 选中任务");
-                        egui::ScrollArea::vertical()
-                            .id_salt("successor_tasks_scroll")
-                            .max_height(150.0)
-                            .show(ui, |ui| {
-                                if task_options.is_empty() {
-                                    ui.weak("暂无可选任务");
-                                }
-
-                                for (task_id, label) in &task_options {
-                                    let mut selected =
-                                        self.add_node_form.successor_ids.contains(task_id);
-                                    if ui.checkbox(&mut selected, label).changed() {
-                                        if selected {
-                                            self.add_node_form
-                                                .successor_ids
-                                                .insert(task_id.clone());
-                                            self.add_node_form.predecessor_ids.remove(task_id);
-                                        } else {
-                                            self.add_node_form.successor_ids.remove(task_id);
-                                        }
-                                    }
-                                }
-                            });
-                    });
-                });
-
-                if let Some(error) = &self.add_node_form.error {
+                if let Some(error) = validation_error.as_ref() {
                     ui.add_space(8.0);
                     ui.colored_label(Color32::from_rgb(190, 55, 45), error);
                 }
 
                 ui.add_space(12.0);
-                ui.horizontal(|ui| {
-                    add_clicked = ui.button("添加").clicked();
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let add_enabled = validation_error.is_none();
+                    let add_button = egui::Button::new("添加")
+                        .fill(Color32::from_rgb(64, 118, 205))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(42, 88, 170)));
+                    add_clicked = ui.add_enabled(add_enabled, add_button).clicked();
                     cancel_clicked = ui.button("取消").clicked();
                 });
             });
+
+        if form_changed {
+            self.add_node_form.error = None;
+        }
+
+        if open && ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel_clicked = true;
+        }
+
+        if open
+            && ctx.input(|i| {
+                i.key_pressed(egui::Key::Enter)
+                    && !i.modifiers.shift
+                    && !i.modifiers.ctrl
+                    && !i.modifiers.command
+            })
+            && validation_error.is_none()
+        {
+            add_clicked = true;
+        }
 
         if cancel_clicked {
             open = false;
@@ -1399,16 +1884,11 @@ impl InputWindow {
     }
 
     fn draw_node_detail_panel(&mut self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("节点信息");
-            if self.selected_node_id.is_some() && ui.button("取消选择").clicked() {
-                self.selected_node_id = None;
-            }
-        });
-        ui.separator();
-
-        let Some(selected_id) = self.selected_node_id.as_deref() else {
+        let Some(selected_id) = self.selected_node_id.clone() else {
             ui.weak("点击图中的节点查看详细信息");
+            if self.mode == RunningMode::Idle && ui.button("添加节点...").clicked() {
+                self.open_add_node_dialog(&[], &[]);
+            }
             return;
         };
 
@@ -1417,7 +1897,12 @@ impl InputWindow {
             return;
         };
 
-        let Some(task) = data.tasks.iter().find(|task| task.id == selected_id) else {
+        let Some(task) = data
+            .tasks
+            .iter()
+            .find(|task| task.id == selected_id)
+            .cloned()
+        else {
             ui.weak("选中的节点已不存在");
             return;
         };
@@ -1425,15 +1910,55 @@ impl InputWindow {
         let schedule = self
             .critical_path
             .as_ref()
-            .and_then(|result| result.schedules.iter().find(|item| item.task_id == task.id));
+            .and_then(|result| result.schedules.iter().find(|item| item.task_id == task.id))
+            .cloned();
 
-        ui.label(format!("ID: {}", task.id));
-        ui.add(egui::Label::new(format!("名称: {}", task.name)).wrap());
-        ui.label(format!(
-            "三点估算: {:.1} / {:.1} / {:.1} 天",
-            task.duration_optimistic, task.duration_normal, task.duration_pessimistic
-        ));
-        ui.label(format!("PERT 工期: {:.1} 天", task.pert()));
+        let predecessors = self.task_refs_for(&selected_id, true);
+        let successors = self.task_refs_for(&selected_id, false);
+        let mut add_predecessor = false;
+        let mut add_successor = false;
+        let mut delete_selected = false;
+
+        ui.horizontal_wrapped(|ui| {
+            if ui.button("取消选择").clicked() {
+                self.selected_node_id = None;
+            }
+            let edit_enabled = self.mode == RunningMode::Idle;
+            add_predecessor = ui
+                .add_enabled(edit_enabled, egui::Button::new("添加前置节点..."))
+                .clicked();
+            add_successor = ui
+                .add_enabled(edit_enabled, egui::Button::new("添加后续节点..."))
+                .clicked();
+            delete_selected = ui
+                .add_enabled(edit_enabled, egui::Button::new("删除节点..."))
+                .clicked();
+        });
+
+        ui.separator();
+        ui.add(egui::Label::new(egui::RichText::new(&task.name).strong()).wrap());
+        ui.weak(format!("ID: {}", task.id));
+
+        egui::Grid::new("node_detail_grid")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.weak("乐观");
+                ui.label(format!("{:.1} 天", task.duration_optimistic));
+                ui.end_row();
+
+                ui.weak("最可能");
+                ui.label(format!("{:.1} 天", task.duration_normal));
+                ui.end_row();
+
+                ui.weak("悲观");
+                ui.label(format!("{:.1} 天", task.duration_pessimistic));
+                ui.end_row();
+
+                ui.weak("PERT");
+                ui.label(format!("{:.1} 天", task.pert()));
+                ui.end_row();
+            });
 
         if let Some(schedule) = schedule {
             ui.add_space(6.0);
@@ -1453,12 +1978,19 @@ impl InputWindow {
             ui.label(format!("总时差: {:.1} 天", schedule.slack));
         }
 
-        let predecessors = self.task_refs_for(selected_id, true);
-        let successors = self.task_refs_for(selected_id, false);
-
         ui.add_space(6.0);
         ui.add(egui::Label::new(format!("前置: {}", predecessors)).wrap());
         ui.add(egui::Label::new(format!("后续: {}", successors)).wrap());
+
+        if add_predecessor {
+            self.open_add_node_dialog(&[], &[selected_id.clone()]);
+        }
+        if add_successor {
+            self.open_add_node_dialog(&[selected_id.clone()], &[]);
+        }
+        if delete_selected {
+            self.confirm_delete_node_id = Some(selected_id);
+        }
     }
 
     fn task_refs_for(&self, task_id: &str, incoming: bool) -> String {
@@ -1502,10 +2034,6 @@ impl InputWindow {
     }
 
     fn draw_chat_panel(&self, ui: &mut Ui) {
-        ui.horizontal(|ui| {
-            ui.heading("对话记录");
-        });
-        ui.separator();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
             .stick_to_bottom(true)
@@ -1517,14 +2045,61 @@ impl InputWindow {
                     ui.add_space(4.0);
                     if msg.is_user {
                         ui.colored_label(Color32::from_rgb(60, 100, 180), "你");
+                    } else if msg.is_error {
+                        ui.colored_label(Color32::from_rgb(190, 55, 45), "助手");
                     } else {
                         ui.colored_label(Color32::from_rgb(180, 80, 60), "助手");
                     }
-                    ui.add(egui::Label::new(&msg.content).wrap());
+                    ui.horizontal(|ui| {
+                        if msg.pending {
+                            ui.spinner();
+                        }
+                        let text = if msg.is_error {
+                            egui::RichText::new(&msg.content).color(Color32::from_rgb(190, 55, 45))
+                        } else {
+                            egui::RichText::new(&msg.content)
+                        };
+                        ui.add(egui::Label::new(text).wrap());
+                    });
                     ui.add_space(2.0);
                     ui.separator();
                 }
             });
+    }
+
+    fn draw_delete_confirmation(&mut self, ctx: &egui::Context) {
+        let Some(node_id) = self.confirm_delete_node_id.clone() else {
+            return;
+        };
+
+        let label = self.task_label(&node_id).unwrap_or_else(|| node_id.clone());
+        let mut open = true;
+        let mut confirmed = false;
+        let mut cancelled = false;
+
+        egui::Window::new("删除节点")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.add(egui::Label::new(format!("确定删除 {} 吗？", label)).wrap());
+                ui.weak("与该节点相连的依赖关系也会一起删除。");
+                ui.add_space(12.0);
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    let delete_button = egui::Button::new("删除")
+                        .fill(Color32::from_rgb(190, 55, 45))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(150, 35, 30)));
+                    confirmed = ui.add(delete_button).clicked();
+                    cancelled = ui.button("取消").clicked();
+                });
+            });
+
+        if confirmed {
+            self.delete_node(&node_id);
+            self.confirm_delete_node_id = None;
+        } else if cancelled || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            self.confirm_delete_node_id = None;
+        }
     }
 }
 
@@ -1535,7 +2110,7 @@ impl eframe::App for InputWindow {
         self.poll_llm_result();
 
         if self.mode == RunningMode::Running {
-            ui.ctx().request_repaint();
+            ui.ctx().request_repaint_after(Duration::from_millis(120));
         }
 
         egui::Panel::top("top_panel").show_inside(ui, |ui| {
@@ -1551,26 +2126,29 @@ impl eframe::App for InputWindow {
 
         egui::Panel::bottom("bottom_panel").show_inside(ui, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                let button_width = 64.0;
+            ui.horizontal_top(|ui| {
+                let button_width = 72.0;
                 let spacing = ui.spacing().item_spacing.x;
-                let input_width = (ui.available_width() - button_width - spacing).max(180.0);
+                let input_width = (ui.available_width() - button_width - spacing).max(1.0);
                 let input_field = ui.add(
-                    egui::TextEdit::singleline(&mut self.user_input)
-                        .hint_text("描述你的项目任务")
+                    egui::TextEdit::multiline(&mut self.user_input)
+                        .hint_text("描述你的项目任务；Ctrl+Enter 发送")
+                        .desired_rows(2)
                         .desired_width(input_width),
                 );
 
-                if input_field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
-                    self.send_message();
-                }
+                let submit_shortcut = input_field.has_focus()
+                    && ui.input(|i| {
+                        i.key_pressed(egui::Key::Enter) && (i.modifiers.ctrl || i.modifiers.command)
+                    });
 
+                let can_send = self.mode == RunningMode::Idle && !self.user_input.trim().is_empty();
                 let btn = ui.add_enabled(
-                    self.mode == RunningMode::Idle,
-                    egui::Button::new("发送").min_size(Vec2::new(button_width, 24.0)),
+                    can_send,
+                    egui::Button::new("发送").min_size(Vec2::new(button_width, 48.0)),
                 );
 
-                if btn.clicked() {
+                if btn.clicked() || (submit_shortcut && can_send) {
                     self.send_message();
                 }
             });
@@ -1578,12 +2156,21 @@ impl eframe::App for InputWindow {
         });
 
         egui::Panel::right("chat_panel")
-            .min_size(220.0)
+            .min_size(260.0)
             .resizable(true)
             .show_inside(ui, |ui| {
-                self.draw_node_detail_panel(ui);
+                egui::CollapsingHeader::new("节点信息")
+                    .default_open(true)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical()
+                            .max_height(300.0)
+                            .auto_shrink([false, true])
+                            .show(ui, |ui| self.draw_node_detail_panel(ui));
+                    });
                 ui.add_space(10.0);
-                self.draw_chat_panel(ui);
+                egui::CollapsingHeader::new("对话记录")
+                    .default_open(true)
+                    .show(ui, |ui| self.draw_chat_panel(ui));
             });
 
         egui::CentralPanel::default().show_inside(ui, |ui| {
@@ -1597,5 +2184,6 @@ impl eframe::App for InputWindow {
         });
 
         self.draw_add_node_dialog(ui.ctx());
+        self.draw_delete_confirmation(ui.ctx());
     }
 }
